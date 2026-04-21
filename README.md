@@ -1,74 +1,108 @@
 # ANIMA
 
-**ANIMA Open, Generation 1** — an open-source cognitive framework for home robots.
+**ANIMA** = **A**utonomous **N**atural-language **I**nstruction **M**apping **A**rchitecture.
 
-ANIMA = **A**utonomous **N**atural-language **I**nstruction **M**apping **A**rchitecture.
+A domain-agnostic cognitive framework for intent-to-action embodied AI. It turns an upstream signal (BCI, speech, vision, text) into a validated, executable task on any device that implements the adapter protocol.
 
-It turns natural-language instructions ("put the pen in the box") into grounded, executable robot behaviors by combining LLM-based parsing with classical symbolic planning and a behavior-tree runtime.
+## The idea in one paragraph
 
-## What it is (and is not)
+Most embodied-AI stacks either (a) let an LLM emit motor commands directly, which is unsafe and unauditable, or (b) bolt a rigid state machine onto a planner, which does not generalise. ANIMA splits the problem into six layers and five assessment factors: the LLM is used strictly as a **parser** that emits a structured `TaskSpec`, a six-gate **Test-and-Check** rejects unsafe specs before execution, a **behavior tree** runs the plan with tick-level observability, and a **five-factor self-assessment** (ITA/MQA/SQA/GOA/PEA) attaches a probability of success to every decision. The stack is deliberately device-agnostic — the same L1–L3 drives a manipulator, a mobile base, a wheelchair, or a future humanoid through a pluggable L4 adapter.
 
-| | |
-|---|---|
-| **Is** | A reusable cognitive layer for robots running ROS 2. Parses instructions, plans tasks, dispatches skills, validates execution. |
-| **Is not** | A motion planner, a perception model, a hardware driver. ANIMA *coordinates* these — it does not replace them. |
+## Architecture
 
-ANIMA is the brain shared across the **Soma Homies** robot family ([SOMA Arm](https://github.com/jeffliulab/soma-arm) is the first robot using it — a fixed tabletop manipulator that picks and sorts objects by voice command, and serves as the arm capability layer of the future Soma Home), but it is designed to be robot-agnostic.
+```
+  upstream signal (BCI / ASR / vision / text)
+                 │
+                 ▼
+       ┌──────────────────┐
+       │ L0  Signal        │  signal → intent token + confidence + drift
+       └────────┬─────────┘
+                ▼
+       ┌──────────────────┐
+       │ L1  Parser (LLM)  │  instruction → TaskSpec (forced tool-calling)
+       └────────┬─────────┘
+                ▼
+       ┌──────────────────┐
+       │ Test-and-Check    │  6 gates: JSON/intent/skill/params/safety/preconds
+       └────────┬─────────┘
+                ▼
+       ┌──────────────────┐
+       │ L2  Planner       │  TaskSpec → py_trees BehaviorTree
+       └────────┬─────────┘
+                ▼
+       ┌──────────────────┐
+       │ L3  Skill         │  Function-Calling + Affordance Scoring
+       └────────┬─────────┘
+                ▼
+       ┌──────────────────┐
+       │ L4  Adapter       │  device-agnostic actuation (arm / base / ...)
+       └────────┬─────────┘
+                ▼
+       ┌──────────────────┐
+       │ L5  Assessment    │  ITA · MQA · SQA · GOA · PEA (Pre/Runtime/Post)
+       └──────────────────┘
+```
 
-**Why ANIMA exists.** The goal of building the ANIMA cognitive framework is to eventually realize the SOMA home robot — a household robot that helps with chores and makes everyday life happier.
+### Design invariants
+
+1. **LLM-as-Parser, not LLM-as-Generator.** The LLM emits structured `TaskSpec` JSON via forced tool-calling. It never emits motor commands.
+2. **Test-and-Check before execution.** Six gates reject malformed or unsafe specs.
+3. **Five-factor event-triggered self-assessment.** Not continuous logging.
+4. **Three-stage time evaluation.** Pre / Runtime / Post — orthogonal to the five factors.
+5. **GOA composition is multiplicative.** `P(success) = ∏ Pᵢ`. Averaging is forbidden because it masks low-probability bottlenecks.
+6. **PEA retrieval is three-factor.** `recency × 0.5 + relevance × 3.0 + importance × 2.0`.
+7. **Behavior-tree runtime.** No ad-hoc state machines.
+8. **Function-Calling + Affordance Scoring instead of RAG** when the skill set is < 100 entries.
+
+## Quick start
+
+```bash
+git clone https://github.com/jeffliulab/anima.git
+cd anima
+uv venv && source .venv/bin/activate
+uv pip install -e ".[dev]"
+pytest
+```
+
+Ticking a trivial plan end-to-end with the built-in mocks:
+
+```python
+import asyncio
+from anima import TaskSpec, IntentToken, Subtask, Constraints
+from anima.l2_planner import build_tree, run_tree
+
+spec = TaskSpec(
+    intent=IntentToken(token="DRINK_WATER", confidence=0.9,
+                       drift_score=0.05, source_text="I want some water"),
+    subtasks=[
+        Subtask(name="locate_cup", type="locate"),
+        Subtask(name="grasp_cup",  type="grasp"),
+        Subtask(name="lift_cup",   type="lift"),
+    ],
+    constraints=Constraints(max_force_n=8.0, timeout_s=15.0),
+)
+
+tree = build_tree(spec, skill_registry={})  # empty → MockSkillBehaviour
+status = asyncio.run(run_tree(tree, tick_interval_s=0.01))
+print(status)  # Status.SUCCESS
+```
+
+## Reference applications
+
+ANIMA is the brain shared across the **Soma Homies** robot family. Two application branches exist today:
+
+| Application | Repo | What it does |
+|---|---|---|
+| **SOMA Care** | [jeffliulab/soma-care](https://github.com/jeffliulab/soma-care) | Medical-care embodied AI. Hospital-ward simulation with ADL skills (drink, call-help, turn-over, fetch-medicine); upstream signal is text → future BCI. |
+| **SOMA Arm** | [jeffliulab/soma-arm](https://github.com/jeffliulab/soma-arm) | Tabletop manipulator. Chess play: identify legal captures, execute pick-and-place, respect game rules. Upstream signal is text. |
+
+Domain-specific skills (grasp a cup, move a chess piece, wipe a patient) live in those repos, not here. ANIMA itself ships only the framework, the mocks, and the tests.
 
 ## Status
 
-**Pre-alpha.** This is the v1 (`O1`) open-source line — the first generation we are willing to put under public version control. Expect frequent breaking changes until we cut a `0.1.0` tag.
+**Alpha (0.1.x).** First reference implementation landed 2026-04-21 (absorbed from the `anima-intention-action` BCI application branch). APIs may still change prior to `1.0.0`; breaking changes will be flagged with `!` in the commit message and called out in [`CHANGELOG.md`](./CHANGELOG.md).
 
-Design docs (Chinese, more abstract) live in [`SOMA/ANIMA_FRAMEWORK/`](https://github.com/jeffliulab/SOMA) — that's where ideas are sketched before they land here.
-
-## Architecture (planned)
-
-```
-       natural language instruction
-                  │
-                  ▼
-        ┌─────────────────┐
-        │  LLM Parser     │  instruction → TaskSpec (structured)
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │  Task Planner   │  TaskSpec → BehaviorTree
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │  Skill Registry │  selects + dispatches primitive skills
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │  Skill Executor │  ROS 2 actions / services to robot
-        └────────┬────────┘
-                 │
-                 ▼
-        ┌─────────────────┐
-        │  Validator      │  test-and-check before reporting success
-        └─────────────────┘
-```
-
-Core design principle: **LLM-as-a-Parser, not LLM-as-a-Translator.** The LLM produces structured task representations that downstream symbolic components can verify, instead of generating low-level commands directly.
-
-## Repository layout
-
-```
-anima/
-├── README.md
-├── LICENSE                  # (TBD)
-├── pyproject.toml           # (TBD)
-└── src/
-    └── anima/
-        └── __init__.py      # version + public API surface
-```
-
-More structure will be added as the framework grows. See the design docs for the planned full layout.
+Design docs live under [`docs/`](./docs/). The original Anima IP (Chinese, more abstract) is preserved verbatim in [`docs/preserved/`](./docs/preserved/) for provenance.
 
 ## License
 
